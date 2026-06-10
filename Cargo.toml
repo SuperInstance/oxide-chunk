@@ -1,4 +1,6 @@
 [package]
+description = "oxide-chunk - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/oxide-chunk"
 name = "oxide-chunk"
 version = "0.1.0"
 edition = "2024"
