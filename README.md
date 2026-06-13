@@ -1,110 +1,164 @@
 # Oxide Chunk
 
-**Oxide Chunk** provides GPU memory chunk management with ternary allocation status — `+1` (allocated), `0` (fragmented), `-1` (free) — implementing buddy-system splitting, merging, coalescing, and defragmentation for efficient GPU memory utilization.
+**Oxide Chunk** provides GPU memory chunk management with ternary allocation status — `+1 (Allocated)`, `0 (Fragmented)`, `-1 (Free)` — featuring buddy-style splitting and merging, automatic coalescing on deallocation, defragmentation, and utilization statistics.
 
 ## Why It Matters
 
-GPU memory is scarce and expensive — an H100 has 80GB of HBM3 at $30k+. Fragmentation can waste 20-30% of available memory, causing out-of-memory errors even when sufficient free memory exists in fragmented chunks. The buddy allocator solves this by maintaining power-of-two sized blocks that split and merge cleanly. Oxide Chunk adds ternary status tracking: not just free/allocated, but fragmented — indicating a block has some free and some allocated sub-blocks, enabling smarter allocation decisions.
+GPU memory is a scarce resource: a typical GPU has 8-24GB of VRAM shared by dozens of kernels. Without proper memory management, fragmentation — where free memory is split into many small, non-contiguous blocks — makes it impossible to allocate large buffers even when total free memory is sufficient. Oxide Chunk implements the buddy allocator algorithm (used by Linux's old zoned allocator and FreeBSD's uma zone allocator) with ternary status tracking. The buddy system guarantees that any allocation request that fits within total free memory will succeed after at most log₂(N) splits — bounded fragmentation in the worst case.
 
 ## How It Works
 
 ### Buddy Allocator
 
-Memory is divided into blocks of size `2^order` pages. The free list has one entry per order:
+Memory starts as one large free chunk. On allocation, chunks split recursively:
 
 ```
-Order 0: [4KB]  [4KB] [4KB] ...
-Order 1: [8KB]        [8KB] ...
-Order 2:       [16KB] ...
-...
-Order 10: [4MB]
+allocate(size):
+    find smallest free chunk ≥ size     — O(N) scan
+    while chunk.size / 2 ≥ size:
+        split chunk into two buddies    — O(1)
+    mark left buddy as allocated
 ```
 
-**Allocation** (request size S):
-1. Compute order = ceil(log2(S / page_size))
-2. Find smallest free block at that order or above
-3. Split larger blocks down, updating free lists
-4. Return pointer, mark as Allocated (+1)
+On deallocation, adjacent free buddies merge:
 
-Cost: **O(log N)** where N = max order.
+```
+deallocate(offset):
+    mark chunk as free
+    coalesce():
+        sort chunks by offset            — O(N log N)
+        scan for adjacent free buddies   — O(N)
+        merge until no more merges       — O(N) per pass
+```
 
-**Deallocation**:
-1. Mark block as Free (-1)
-2. Check if buddy (address XOR block_size) is also Free
-3. If so, merge into parent block (repeat recursively)
-4. Update free lists
+### Chunk Operations
 
-Cost: **O(log N)** for coalescing.
+```
+Chunk { offset: u64, size: u64, alignment: u64, allocated: bool }
 
-### Ternary Status
+split() → Option<(Chunk, Chunk)>:
+    half = size / 2
+    left = Chunk { offset, size: half }
+    right = Chunk { offset: offset + half, size: half }
+    — only valid if size ≥ 2 and size % 2 == 0
 
-Each chunk tracks one of three states:
-- **Allocated (+1)**: Entirely in use
-- **Fragmented (0)**: Partially used — has sub-blocks in different states
-- **Free (-1)**: Entirely available
+can_merge(other) → bool:
+    !self.allocated && !other.allocated
+    && same alignment
+    && adjacent (self.end == other.offset || other.end == self.offset)
 
-Fragmentation detection: **O(1)** per block (compare allocated_bytes vs capacity).
+merge(other) → Chunk:
+    offset = min(self.offset, other.offset)
+    size = self.size + other.size
+```
+
+Split/merge/can_merge: all **O(1)**.
+
+### Ternary Status Classification
+
+```
+ternary_status() → TernaryStatus:
+    has_allocated = any chunk.allocated
+    has_free = any !chunk.allocated
+    match (has_allocated, has_free):
+        (true, false) → Allocated (+1)   // fully utilized
+        (true, true)  → Fragmented (0)   // mixed — normal operating
+        (false, _)    → Free (-1)        // empty pool
+```
+
+Status: **O(N)** single pass over chunks.
 
 ### Defragmentation
 
-The defragmentation pass scans all chunks and compacts allocations:
+Compacts all allocated chunks to the beginning:
 
 ```
-for each fragmented chunk:
-    move allocated sub-blocks to contiguous free space
-    merge freed regions
-    update status to Free or Allocated
+defragment():
+    collect allocated chunks sorted by offset
+    cursor = 0
+    for each allocated chunk:
+        move to cursor (respecting alignment)
+        cursor += chunk.size
+    create single free chunk from cursor to end
 ```
 
-Cost: **O(N)** where N = number of allocated blocks. Triggers when fragmentation ratio exceeds threshold.
+Defragmentation: **O(N log N)** (sort + rebuild). After defrag, fragmentation_ratio → 0.
 
-### Utilization Statistics
+### Fragmentation Metrics
 
 ```
-utilization = allocated_bytes / total_bytes
-fragmentation = 1 - (largest_free_block / total_free)
+utilization() = Σ allocated_sizes / total_size
+
+fragmentation_ratio() = 1 - (largest_free_block / total_free)
+    0.0 = no fragmentation (one big free block)
+    1.0 = maximally fragmented (many tiny free blocks)
+
+largest_free_block() = max(free chunk sizes)
 ```
 
-Both: **O(1)** to compute from tracked counters.
+All: **O(N)** single pass.
+
+### Complexity Summary
+
+| Operation | Cost |
+|-----------|------|
+| `allocate(size)` | O(N) best-fit search + O(log S) splits |
+| `deallocate(offset)` | O(N) find + O(N log N) coalesce |
+| `coalesce()` | O(N²) worst case, O(N) typical |
+| `defragment()` | O(N log N) |
+| `utilization()` | O(N) |
+| `fragmentation_ratio()` | O(N) |
+| `ternary_status()` | O(N) |
+
+Where N = number of chunk entries (typically 10-1000).
 
 ## Quick Start
 
 ```rust
-use oxide_chunk::{ChunkManager, TernaryStatus};
+use oxide_chunk::{ChunkAllocator, TernaryStatus};
 
-let mut mgr = ChunkManager::new(1024 * 1024); // 1MB pool
-let ptr1 = mgr.alloc(4096).unwrap();
-let ptr2 = mgr.alloc(8192).unwrap();
+let mut alloc = ChunkAllocator::new(4096, 1); // 4KB pool, 1-byte align
 
-println!("Status: {:?}", mgr.chunk_status(ptr1)); // Allocated
+// Allocate
+let a = alloc.allocate(512).unwrap();
+let b = alloc.allocate(256).unwrap();
+println!("Utilization: {:.1}%", alloc.utilization() * 100);
+println!("Status: {:?}", alloc.ternary_status()); // Fragmented
 
-mgr.dealloc(ptr1);
-mgr.dealloc(ptr2);
-mgr.defragment(); // Coalesce and compact
+// Deallocate and coalesce
+alloc.deallocate(a);
+alloc.deallocate(b);
+assert_eq!(alloc.ternary_status(), TernaryStatus::Free); // All merged back
+
+// Defragment
+let c = alloc.allocate(128).unwrap();
+let d = alloc.allocate(128).unwrap();
+alloc.deallocate(c);
+alloc.defragment(); // Compact allocated chunks
+println!("Fragmentation: {:.2}", alloc.fragmentation_ratio()); // ~0.0
 ```
 
 ## API
 
-| Type | Description |
-|------|-------------|
-| `TernaryStatus` | `Allocated (+1)`, `Fragmented (0)`, `Free (-1)` |
-| `ChunkManager` | Buddy allocator with ternary tracking |
-| `Chunk` | Individual memory chunk with status and size |
-
-Key methods: `alloc(size)`, `dealloc(ptr)`, `defragment()`, `utilization()`, `fragmentation_ratio()`.
+| Type | Key Methods | Description |
+|------|-------------|-------------|
+| `ChunkAllocator` | `new(total_size, alignment)`, `allocate(size) → Option<u64>`, `deallocate(offset) → bool` | Buddy-style allocator |
+| `ChunkAllocator` | `coalesce()`, `defragment()`, `utilization()`, `fragmentation_ratio()`, `largest_free_block()`, `chunk_count()`, `chunks() → &[Chunk]` | Management and statistics |
+| `Chunk` | `new(offset, size, alignment)`, `split()`, `can_merge(other)`, `merge(other)`, `end()` | Memory region |
+| `TernaryStatus` | `Allocated (+1)`, `Fragmented (0)`, `Free (-1)` | Pool status enum |
 
 ## Architecture Notes
 
-Oxide Chunk is part of the oxide-* GPU memory management stack. In γ + η = C, allocation is γ (growth — expanding to meet compute demands) while deallocation and defragmentation are η (avoidance — reclaiming wasted space and preventing fragmentation-induced OOM). Works with `oxide-epoch` for safe reclamation and `oxide-ring` for buffer management.
+Oxide Chunk provides GPU memory management for SuperInstance. In γ + η = C, Allocated (+1) chunks represent γ (growth — memory actively used for computation), Free (-1) chunks represent η (avoidance — memory available but unused, potential for waste), and Fragmented (0) is the mixed state where the pool is neither fully utilized nor empty. The defragmentation operation directly conserves C: by compacting allocated chunks, it reduces wasted address space while preserving total allocated memory. Integrates with `page-allocator` for OS-level page management and `oxide-ring` for allocation event logging.
 
-See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for GPU memory architecture.
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for GPU memory management architecture.
 
 ## References
 
-1. Knuth, D. E. (1973). *The Art of Computer Programming, Vol. 1*, 3rd ed. Section 2.5: Dynamic Storage Allocation. Addison-Wesley.
-2. Knowlton, K. C. (1965). "A Fast Storage Allocator." *Communications of the ACM*, 8(10), 623–625.
-3. NVIDIA (2024). "CUDA Memory Management Best Practices." *NVIDIA Developer Documentation*.
+1. Knowlton, K. C. (1965). "A Fast Storage Allocator." *Communications of the ACM*, 8(10), 623–625. (Original buddy system)
+2. Knuth, D. E. (1997). *The Art of Computer Programming, Vol. 1*, 3rd ed. Section 2.5: Dynamic Storage Allocation.
+3. Wilson, P. R. et al. (1995). "Dynamic Storage Allocation: A Survey and Critical Review." *International Workshop on Memory Management*. Springer.
 
 ## License
 
-MIT
+MIT OR Apache-2.0
